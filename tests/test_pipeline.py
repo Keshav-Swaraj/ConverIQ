@@ -195,3 +195,108 @@ class TestConverseIQPipelineMocked:
         pipeline, _, _ = mock_pipeline
         result = pipeline.get_chunk(99999)
         assert result == ""
+
+    def test_answer_fallback_when_retrieval_empty(self, mock_pipeline):
+        """When BM25 retrieval returns 0 candidates, pipeline falls back to first 3 chunks."""
+        pipeline, _, _ = mock_pipeline
+        
+        # Override retrieve to return empty list
+        pipeline.index.retrieve = MagicMock(return_value=[])
+        
+        # Mock generate_answer to verify it receives the correct chunks
+        with patch("core.pipeline.generate_answer") as mock_generate:
+            mock_generate.return_value = "Mocked fallback response."
+            
+            result = pipeline.answer("hi")
+            
+            # Assert generate_answer was called with the first 3 chunks
+            expected_chunks = pipeline.chunks[:3]
+            mock_generate.assert_called_once_with(
+                query="hi",
+                context_chunks=expected_chunks,
+                history=[],
+                model=pipeline.model
+            )
+            
+            assert result["answer"] == "Mocked fallback response."
+            assert result["sources"] == expected_chunks
+            assert result["retrieved"] == 0
+
+
+class TestConverseIQPipelineStreaming:
+    """
+    Tests for ConverseIQPipeline and generate_answer streaming functionality.
+    """
+
+    @patch("core.llm.ollama.chat")
+    def test_generate_answer_stream(self, mock_chat):
+        """generate_answer_stream yields tokens from Ollama streaming chat."""
+        from core.llm import generate_answer_stream
+
+        # Mock Ollama streaming response
+        mock_response = [
+            {"message": {"content": "Hello"}},
+            {"message": {"content": " "}},
+            {"message": {"content": "world"}},
+            {"message": {"content": "!"}},
+        ]
+        mock_chat.return_value = iter(mock_response)
+
+        tokens = list(generate_answer_stream("hi", ["chunk"], []))
+        assert tokens == ["Hello", " ", "world", "!"]
+        mock_chat.assert_called_once()
+
+    def test_pipeline_answer_stream_before_upload(self):
+        """pipeline.answer_stream yields helpful message if document not loaded."""
+        from core.pipeline import ConverseIQPipeline
+        with patch("core.pipeline.Reranker"):
+            p = ConverseIQPipeline()
+            chunks = list(p.answer_stream("hi"))
+            assert len(chunks) == 1
+            assert chunks[0]["done"] is True
+            assert chunks[0]["token"] == ""
+
+    @patch("core.pipeline.generate_answer_stream")
+    def test_pipeline_answer_stream_success(self, mock_gen_stream, tmp_path):
+        """pipeline.answer_stream yields token chunks and updates memory upon completion."""
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import letter
+        from core.pipeline import ConverseIQPipeline
+
+        # Create a simple PDF
+        pdf_path = tmp_path / "stream_test.pdf"
+        c = canvas.Canvas(str(pdf_path), pagesize=letter)
+        c.drawString(50, 700, "This is a streaming test PDF document.")
+        c.save()
+
+        # Mock generator stream
+        mock_gen_stream.return_value = iter(["Streamed", " ", "response"])
+
+        with patch("core.pipeline.Reranker") as MockReranker:
+            mock_reranker_instance = MagicMock()
+            MockReranker.return_value = mock_reranker_instance
+            mock_reranker_instance.rerank.side_effect = lambda q, c, top_k=3: c[:top_k]
+
+            pipeline = ConverseIQPipeline()
+            pipeline.load_document(str(pdf_path))
+
+            # Force index to return a mock chunk
+            pipeline.index.retrieve = MagicMock(return_value=[
+                {"chunk": "Streaming test chunk.", "score": 1.0, "index": 0}
+            ])
+
+            # Collect streamed chunks
+            chunks = list(pipeline.answer_stream("Test query"))
+            
+            # Assertions on chunks
+            assert len(chunks) == 4  # 3 tokens + 1 done chunk
+            assert chunks[0] == {"token": "Streamed", "sources": ["Streaming test chunk."], "done": False}
+            assert chunks[1] == {"token": " ", "sources": ["Streaming test chunk."], "done": False}
+            assert chunks[2] == {"token": "response", "sources": ["Streaming test chunk."], "done": False}
+            assert chunks[3] == {"token": "", "sources": ["Streaming test chunk."], "done": True}
+
+            # Assert memory updated correctly
+            assert len(pipeline.memory) == 1
+            assert pipeline.memory.history[0]["content"] == "Test query"
+            assert pipeline.memory.history[1]["content"] == "Streamed response"
+

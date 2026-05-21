@@ -13,30 +13,85 @@ def upload_document(file):
     return f"✅ {result['status']} ({result['chunks']} chunks indexed)"
 
 
-def ask_question(question, history):
-    if not question.strip():
-        return history, ""
+def normalize_history(history):
+    if not history:
+        return []
+    normalized = []
+    for item in history:
+        if isinstance(item, (list, tuple)):
+            if len(item) >= 2:
+                user_msg = item[0]
+                bot_msg = item[1]
+                normalized.append({"role": "user", "content": str(user_msg)})
+                normalized.append({"role": "assistant", "content": str(bot_msg)})
+            elif len(item) == 1:
+                normalized.append({"role": "user", "content": str(item[0])})
+        elif isinstance(item, dict):
+            role = item.get("role")
+            content = item.get("content")
+            if role and content is not None:
+                if isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and "text" in part:
+                            text_parts.append(part["text"])
+                        else:
+                            text_parts.append(str(part))
+                    content = "".join(text_parts)
+                elif isinstance(content, dict) and "text" in content:
+                    content = content["text"]
+                else:
+                    content = str(content)
+                normalized.append({"role": role, "content": content})
+        else:
+            # Skip invalid structures to keep list-of-dicts strict
+            pass
+    return normalized
 
-    history = history or []
+
+def ask_question_stream(question, history):
+    if not question.strip():
+        yield history, ""
+        return
+
+    history = normalize_history(history)
+
+    # Display user query with immediate thinking placeholder
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": "⏳ *Thinking...*"})
+    yield history, ""
 
     if not pipeline.document_loaded:
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": "⚠️ Please upload a PDF document first before asking questions."})
-        return history, ""
+        history[-1]["content"] = "⚠️ Please upload a PDF document first before asking questions."
+        yield history, ""
+        return
 
-    result = pipeline.answer(question)
-    answer = result["answer"]
+    try:
+        # Clear thinking status and start streaming from pipeline
+        history[-1]["content"] = ""
+        sources_used = []
+        
+        for chunk in pipeline.answer_stream(question):
+            if not chunk["done"]:
+                history[-1]["content"] += chunk["token"]
+                yield history, ""
+            else:
+                sources_used = chunk["sources"]
 
-    # Format sources
-    sources_text = "\n\n".join([
-        f"📄 **Source {i+1}:**\n{src[:300]}..."
-        for i, src in enumerate(result["sources"])
-    ])
+        # Append source chunks at the very end
+        if sources_used:
+            sources_text = "\n\n".join([
+                f"📄 **Source {i+1}:**\n{src[:300]}..."
+                for i, src in enumerate(sources_used)
+            ])
+            history[-1]["content"] += f"\n\n---\n**Sources used:**\n{sources_text}"
+        
+        yield history, ""
+    except Exception as e:
+        history[-1]["content"] = f"⚠️ Error: {e}"
+        yield history, ""
 
-    full_response = f"{answer}\n\n---\n**Sources used:**\n{sources_text}" if sources_text else answer
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": full_response})
-    return history, ""
+
 
 
 with gr.Blocks(title="ConverseIQ — Talk to Your Documents") as app:
@@ -75,12 +130,12 @@ Upload a PDF, then ask any question about it. The system retrieves the most rele
                 clear_btn = gr.Button("Clear Chat")
 
             submit_btn.click(
-                ask_question,
+                ask_question_stream,
                 inputs=[question_input, chatbot],
                 outputs=[chatbot, question_input]
             )
             question_input.submit(
-                ask_question,
+                ask_question_stream,
                 inputs=[question_input, chatbot],
                 outputs=[chatbot, question_input]
             )

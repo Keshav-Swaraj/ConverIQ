@@ -3,7 +3,7 @@
 from core.document import load_pdf, chunk_text
 from core.index import DocumentIndex
 from core.reranker import Reranker
-from core.llm import generate_answer
+from core.llm import generate_answer, generate_answer_stream
 from core.memory import ConversationMemory
 
 
@@ -73,15 +73,21 @@ class ConverseIQPipeline:
         candidates = self.index.retrieve(query, top_k=top_k_retrieve)
 
         if not candidates:
-            return {
-                "answer": "I couldn't find relevant content in the document for that question.",
-                "sources": [],
-                "retrieved": 0
-            }
-
-        # Step 2: Cross-encoder reranking
-        reranked = self.reranker.rerank(query, candidates, top_k=top_k_rerank)
-        context_chunks = [r["chunk"] for r in reranked]
+            if self.chunks:
+                # Fall back to first 3 chunks for general queries/greetings/summaries
+                context_chunks = self.chunks[:3]
+                retrieved_count = 0
+            else:
+                return {
+                    "answer": "I couldn't find relevant content in the document for that question.",
+                    "sources": [],
+                    "retrieved": 0
+                }
+        else:
+            # Step 2: Cross-encoder reranking
+            reranked = self.reranker.rerank(query, candidates, top_k=top_k_rerank)
+            context_chunks = [r["chunk"] for r in reranked]
+            retrieved_count = len(candidates)
 
         # Step 3: LLM answer generation
         answer = generate_answer(
@@ -97,8 +103,56 @@ class ConverseIQPipeline:
         return {
             "answer": answer,
             "sources": context_chunks,
-            "retrieved": len(candidates)
+            "retrieved": retrieved_count
         }
+
+    def answer_stream(self, query: str, top_k_retrieve: int = 10, top_k_rerank: int = 3):
+        """
+        Stream the answer for a query.
+        Yields dicts with the format: {"token": str, "sources": list[str], "done": bool}
+        """
+        if not self.document_loaded:
+            yield {"token": "", "sources": [], "done": True}
+            return
+
+        # Step 1: BM25 retrieval
+        candidates = self.index.retrieve(query, top_k=top_k_retrieve)
+
+        if not candidates:
+            if self.chunks:
+                context_chunks = self.chunks[:3]
+                retrieved_count = 0
+            else:
+                yield {
+                    "token": "I couldn't find relevant content in the document for that question.",
+                    "sources": [],
+                    "done": True
+                }
+                return
+        else:
+            # Step 2: Cross-encoder reranking
+            reranked = self.reranker.rerank(query, candidates, top_k=top_k_rerank)
+            context_chunks = [r["chunk"] for r in reranked]
+            retrieved_count = len(candidates)
+
+        # Step 3: LLM answer generation (streaming)
+        full_answer = ""
+        try:
+            for token in generate_answer_stream(
+                query=query,
+                context_chunks=context_chunks,
+                history=self.memory.get(),
+                model=self.model
+            ):
+                full_answer += token
+                yield {"token": token, "sources": context_chunks, "done": False}
+            
+            # Step 4: Update memory on completion
+            self.memory.add(query, full_answer)
+            yield {"token": "", "sources": context_chunks, "done": True}
+        except Exception as e:
+            yield {"token": f"⚠️ Error: {e}", "sources": context_chunks, "done": True}
+
 
     def get_chunk(self, index: int) -> str:
         """Get a specific chunk by index — used by narration thread."""
