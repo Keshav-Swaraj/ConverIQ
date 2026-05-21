@@ -17,9 +17,11 @@ def ask_question(question, history):
     if not question.strip():
         return history, ""
 
+    history = history or []
+
     if not pipeline.document_loaded:
-        history = history or []
-        history.append([question, "⚠️ Please upload a PDF document first before asking questions."])
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": "⚠️ Please upload a PDF document first before asking questions."})
         return history, ""
 
     result = pipeline.answer(question)
@@ -32,8 +34,8 @@ def ask_question(question, history):
     ])
 
     full_response = f"{answer}\n\n---\n**Sources used:**\n{sources_text}" if sources_text else answer
-    history = history or []
-    history.append([question, full_response])
+    history.append({"role": "user", "content": question})
+    history.append({"role": "assistant", "content": full_response})
     return history, ""
 
 
@@ -82,7 +84,7 @@ Upload a PDF, then ask any question about it. The system retrieves the most rele
                 inputs=[question_input, chatbot],
                 outputs=[chatbot, question_input]
             )
-            clear_btn.click(lambda: [], outputs=chatbot)
+            clear_btn.click(lambda: [], outputs=chatbot)  # reset to empty messages list
 
     gr.Markdown(
         """---
