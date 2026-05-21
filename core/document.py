@@ -1,6 +1,6 @@
 # core/document.py
 
-import pdfplumber
+import PyPDF2
 import re
 import nltk
 nltk.download('punkt', quiet=True)
@@ -21,8 +21,9 @@ def load_pdf(file_path: str) -> str:
 
     full_text = []
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
+    with open(file_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        for page in reader.pages:
             text = page.extract_text()
             if text:
                 full_text.append(text)
